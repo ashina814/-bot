@@ -6,11 +6,16 @@ import random
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import threading
 
 import discord
 from discord.ext import commands
+# Koyebのヘルスチェックに対応するためのWebサーバー機能
+from fastapi import FastAPI
+import uvicorn
 
 # ---- 設定 ----
+# Koyebで永続ボリュームを設定しない場合は、データは再起動時に消えます
 DATA_FILE = Path("omikuji_data.json")
 TIMEZONE = ZoneInfo("Asia/Tokyo")
 
@@ -45,13 +50,15 @@ OMIKUJI_MESSAGES = [
 # ----------------
 
 intents = discord.Intents.default()
+# コマンドのプレフィックスは '!'
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ファイルロック（async）
+# ファイルロック（非同期処理でのデータ競合を防ぐ）
 data_lock = asyncio.Lock()
 
 
 async def load_data() -> dict:
+    """JSONファイルからユーザーデータを非同期で読み込む"""
     async with data_lock:
         if not DATA_FILE.exists():
             return {}
@@ -59,32 +66,40 @@ async def load_data() -> dict:
             text = DATA_FILE.read_text(encoding="utf-8")
             if not text:
                 return {}
+            # JSON文字列をPythonの辞書に変換
             return json.loads(text)
         except Exception as e:
+            # 読み込み失敗時は警告を出し、空の辞書を返す
             print("warning: failed to read data file:", e)
             return {}
 
 
 async def save_data(data: dict) -> None:
+    """ユーザーデータを非同期でJSONファイルに書き込む（アトミックな書き込み）"""
     async with data_lock:
+        # 一時ファイルに書き込み、成功後にリネームすることで、書き込み途中の破損を防ぐ
         tmp = DATA_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(DATA_FILE)
 
 
 def today_str() -> str:
-    return datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+    """現在の日付を 'YYYY-MM-DD' 形式で東京タイムゾーンで取得する"""
+    return datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y-%m-%d")
 
 
 async def ensure_user(data: dict, user_id: str) -> None:
+    """ユーザーデータが存在しない場合に初期化する"""
     if user_id not in data:
         data[user_id] = {"last_omikuji": "", "元": 0}
 
 
 @bot.event
 async def on_ready():
+    """BotがDiscordにログイン完了したときに実行される"""
     print(f"Logged in as {bot.user} (id: {bot.user.id})")
     try:
+        # スラッシュコマンドをDiscordに同期
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} command(s)")
     except Exception as e:
@@ -93,6 +108,8 @@ async def on_ready():
 
 @bot.tree.command(name="omikuji", description="今日のおみくじを引きます（1日1回）。")
 async def omikuji(interaction: discord.Interaction):
+    """おみくじコマンドの処理"""
+    # 処理に時間がかかるため、応答を遅延させる
     await interaction.response.defer()
 
     uid = str(interaction.user.id)
@@ -100,14 +117,16 @@ async def omikuji(interaction: discord.Interaction):
     await ensure_user(data, uid)
 
     today = today_str()
+    # 本日既におみくじを引いているかチェック
     if data[uid].get("last_omikuji") == today:
         await interaction.followup.send(
             f"{interaction.user.mention} は今日すでにおみくじを引いています。明日またどうぞ。",
-            ephemeral=True
+            # ephemeral=True でメッセージを引いた本人にしか見えないようにする
+            ephemeral=True 
         )
         return
 
-    # 重み付き抽選
+    # 重み付き抽選の実行
     names = [r[0] for r in OMIKUJI_RESULTS]
     weights = [r[1] for r in OMIKUJI_RESULTS]
     result = random.choices(names, weights=weights, k=1)[0]
@@ -115,12 +134,15 @@ async def omikuji(interaction: discord.Interaction):
 
     reward = 0
     if result == "大凶":
+        # 大凶の場合のみ、特別報酬を付与
         reward = OMIKUJI_BAD_REWARD
         data[uid]["元"] = data[uid].get("元", 0) + reward
 
+    # データ更新
     data[uid]["last_omikuji"] = today
     await save_data(data)
 
+    # 応答メッセージの作成と送信
     reply = f"{interaction.user.mention} のおみくじ — **{result}**\n『{message}』"
     if reward:
         reply += f"\n(特別に {reward}元 を付与しました)"
@@ -128,10 +150,36 @@ async def omikuji(interaction: discord.Interaction):
     await interaction.followup.send(reply)
 
 
-# ---------------- Run ----------------
+# ---------------- Koyeb ヘルスチェック対策 ----------------
+
+def start_server():
+    """Botとは別のスレッドでWebサーバーを起動する"""
+    # サーバーインスタンスを作成
+    app = FastAPI()
+
+    @app.get("/")
+    def read_root():
+        # Koyebのヘルスチェックがこのエンドポイントを叩きます
+        return {"status": "Bot is Running", "discord_user": str(bot.user)}
+
+    # uvicornを使ってサーバーを0.0.0.0:8080で起動
+    # Koyebのデフォルトポートは8080です
+    uvicorn.run(app, host="0.0.0.0", port=8080)
+
+
+# ---------------- Botの起動 ----------------
 if __name__ == "__main__":
-    TOKEN = os.getenv("DISCORD_TOKEN")  # ← GitHubに載せても安全
+    # 環境変数からトークンを取得。ローカルやKoyebで安全に実行するために必須。
+    TOKEN = os.getenv("DISCORD_TOKEN")
+    
     if not TOKEN:
-        print("Error: 環境変数 DISCORD_TOKEN が設定されていません。")
+        print("Error: 環境変数 DISCORD_TOKEN が設定されていません。Botを終了します。")
     else:
+        # 1. Webサーバーを別スレッドで起動する (Koyeb対策)
+        server_thread = threading.Thread(target=start_server)
+        server_thread.daemon = True # メインスレッド終了時に一緒に終了させる
+        server_thread.start()
+        
+        # 2. Discord Botをメインスレッドで起動する
+        print("Starting Discord Bot...")
         bot.run(TOKEN)
