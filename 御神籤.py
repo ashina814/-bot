@@ -164,7 +164,7 @@ def start_server():
 
     # uvicornを使ってサーバーを0.0.0.0:8080で起動
     # Koyebのデフォルトポートは8080です
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
 # ---------------- Botの起動 ----------------
